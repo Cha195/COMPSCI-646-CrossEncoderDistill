@@ -20,16 +20,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 @dataclass
 class TrainConfig:
-    train_path: str = "/Users/aneeshsathe/Desktop/tiny-experiments/qwendistill/kd_multihop_dev_set.jsonl"
+    train_path: str = "/content/kd_multihop_dev_set.jsonl"
     val_path: str | None = None
 
-    output_dir: str = "/Users/aneeshsathe/Desktop/tiny-experiments/qwendistill/checkpoints/bge_student"
+    output_dir: str = "/content"
 
     student_name: str = "BAAI/bge-m3"
     teacher_name: str = "Qwen/Qwen3-Reranker-0.6B"
 
-    batch_size: int = 8
-    max_negs: int = 8
+    batch_size: int = 2
+    max_negs: int = 2
     max_q_len: int = 64
     max_d_len: int = 256
 
@@ -42,8 +42,8 @@ class TrainConfig:
     temperature: float = 0.07
     lambda_align: float = 0.5
 
-    eval_every_steps: int = 500
-    save_every_steps: int = 2000
+    eval_every_steps: int = 10
+    save_every_steps: int = 10
 
     max_teacher_length: int = 2048
 
