@@ -136,54 +136,15 @@ class MultiHopBGETrainDataset(Dataset):
 
 
 class BGETrainCollator:
-    def __init__(self, tokenizer, max_q_len: int = 64, max_d_len: int = 256):
-        self.tokenizer = tokenizer
-        self.max_q_len = max_q_len
-        self.max_d_len = max_d_len
-
+    """Simple collator that just batches raw text. Each model tokenizes independently."""
+    
     def __call__(self, batch):
-        # raw texts
         queries_raw = [b["query"] for b in batch]
         positives_raw = [b["positive"] for b in batch]
         negatives_raw = [b["negatives"] for b in batch]
-
         docs_raw = [[b["positive"]] + b["negatives"] for b in batch]  # [B][1+M]
 
-        # flatten docs
-        flat_docs_raw = [d for docs in docs_raw for d in docs]
-
-        # tokenize queries
-        q_tok = self.tokenizer(
-            queries_raw,
-            padding=True,
-            truncation=True,
-            max_length=self.max_q_len,
-            return_tensors="pt",
-        )
-
-        # tokenize docs
-        d_tok = self.tokenizer(
-            flat_docs_raw,
-            padding=True,
-            truncation=True,
-            max_length=self.max_d_len,
-            return_tensors="pt",
-        )
-
-        B = len(batch)
-        num_docs = len(docs_raw[0])
-        assert all(len(d) == num_docs for d in docs_raw), (
-            "variable num_docs per example"
-        )
-
-        d_input_ids = d_tok["input_ids"].view(B, num_docs, -1)
-        d_attention_mask = d_tok["attention_mask"].view(B, num_docs, -1)
-
         return {
-            "q_input_ids": q_tok["input_ids"],
-            "q_attention_mask": q_tok["attention_mask"],
-            "d_input_ids": d_input_ids,
-            "d_attention_mask": d_attention_mask,
             "queries_raw": queries_raw,
             "positives_raw": positives_raw,
             "negatives_raw": negatives_raw,
@@ -199,25 +160,48 @@ class BGETrainCollator:
 class BGEStudent(nn.Module):
     def __init__(self, model_name: str):
         super().__init__()
-        # SentenceTransformer wrapper for BGE-M3
+        # SentenceTransformer handles tokenization, pooling, and normalization
         self.model = SentenceTransformer(model_name)
-        # underlying HF transformer module
-        self.encoder = self.model._first_module().auto_model
+        # Move model to device (will be set later in trainer)
+        self._device = None
 
-    def encode(self, input_ids, attention_mask):
+    def encode(self, texts, max_length: int = 256):
         """
-        input_ids: [B, L]
-        attention_mask: [B, L]
-        returns: [B, H] CLS-based, L2-normalized embeddings
+        texts: list[str] or str
+        max_length: maximum sequence length
+        returns: [B, H] CLS-based, L2-normalized embeddings as torch.Tensor
         """
-        outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        # CLS pooling
-        emb = outputs.last_hidden_state[:, 0, :]  # [B, H]
-        emb = torch.nn.functional.normalize(emb, p=2, dim=-1)
-        return emb
+        if isinstance(texts, str):
+            texts = [texts]
+        
+        # Temporarily set tokenizer max_length if different
+        original_max_length = self.model.tokenizer.model_max_length
+        if max_length != original_max_length:
+            self.model.tokenizer.model_max_length = max_length
+        
+        try:
+            # SentenceTransformer.encode() handles:
+            # - Tokenization with model's tokenizer
+            # - CLS pooling (for BGE-M3)
+            # - L2 normalization
+            embeddings = self.model.encode(
+                texts,
+                convert_to_tensor=True,
+                show_progress_bar=False,
+                normalize_embeddings=True,  # L2 normalization
+            )
+        finally:
+            # Restore original max_length
+            if max_length != original_max_length:
+                self.model.tokenizer.model_max_length = original_max_length
+        
+        return embeddings  # Already on correct device via model.to(device)
+
+    def to(self, device):
+        """Override to track device"""
+        self.model = self.model.to(device)
+        self._device = device
+        return self
 
     def save(self, output_dir: str):
         os.makedirs(output_dir, exist_ok=True)
@@ -344,12 +328,8 @@ class DistillationTrainer:
 
         # student
         self.student = BGEStudent(cfg.student_name)
-        # Move to device if needed
-        if hasattr(self.student.model, "to"):
-            self.student.model = self.student.model.to(self.device)
-
-        # Get tokenizer from student model
-        self.student_tokenizer = self.student.model.tokenizer
+        # Move to device
+        self.student = self.student.to(self.device)
 
         # teacher
         self.teacher = QwenReranker(
@@ -358,12 +338,8 @@ class DistillationTrainer:
             device=self.device,
         )
 
-        # collator
-        self.collator = BGETrainCollator(
-            self.student_tokenizer,
-            max_q_len=cfg.max_q_len,
-            max_d_len=cfg.max_d_len,
-        )
+        # collator (no tokenization - each model handles its own)
+        self.collator = BGETrainCollator()
 
         # data
         self.train_dataset = MultiHopBGETrainDataset(
@@ -466,31 +442,25 @@ class DistillationTrainer:
     def training_step(self, batch):
         self.student.train()
 
-        # token ids & masks
-        q_ids = batch["q_input_ids"].to(self.device)
-        q_attn = batch["q_attention_mask"].to(self.device)
-
-        d_ids = batch["d_input_ids"].to(self.device)
-        d_attn = batch["d_attention_mask"].to(self.device)
-
-        # raw strings for teacher
+        # raw strings
         queries_raw = batch["queries_raw"]
         positives_raw = batch["positives_raw"]
         negatives_raw = batch["negatives_raw"]
+        docs_raw = batch["docs_raw"]  # [B][num_docs]
 
-        B, num_docs, L = d_ids.shape
+        B = len(queries_raw)
+        num_docs = len(docs_raw[0])
 
         # ===== student forward =====
-        # queries
-        q_emb = self.student.encode(q_ids, q_attn)  # [B, H]
+        # Encode queries
+        q_emb = self.student.encode(queries_raw, max_length=self.cfg.max_q_len)  # [B, H]
 
-        # docs
-        d_ids_flat = d_ids.view(B * num_docs, L)
-        d_attn_flat = d_attn.view(B * num_docs, L)
-        d_emb_flat = self.student.encode(d_ids_flat, d_attn_flat)  # [B*num_docs, H]
+        # Encode all documents (flatten then reshape)
+        flat_docs = [doc for docs in docs_raw for doc in docs]  # [B*num_docs]
+        d_emb_flat = self.student.encode(flat_docs, max_length=self.cfg.max_d_len)  # [B*num_docs, H]
         d_emb = d_emb_flat.view(B, num_docs, -1)  # [B, num_docs, H]
 
-        # student scores
+        # student scores (cosine similarity)
         scores = torch.sum(q_emb.unsqueeze(1) * d_emb, dim=-1)  # [B, num_docs]
 
         # ===== teacher scores =====
@@ -517,23 +487,18 @@ class DistillationTrainer:
         total_batches = 0
 
         for batch in tqdm(self.val_loader, desc="Evaluating", leave=False):
-            q_ids = batch["q_input_ids"].to(self.device)
-            q_attn = batch["q_attention_mask"].to(self.device)
-
-            d_ids = batch["d_input_ids"].to(self.device)
-            d_attn = batch["d_attention_mask"].to(self.device)
-
             queries_raw = batch["queries_raw"]
             positives_raw = batch["positives_raw"]
             negatives_raw = batch["negatives_raw"]
+            docs_raw = batch["docs_raw"]
 
-            B, num_docs, L = d_ids.shape
+            B = len(queries_raw)
+            num_docs = len(docs_raw[0])
 
             # student
-            q_emb = self.student.encode(q_ids, q_attn)
-            d_ids_flat = d_ids.view(B * num_docs, L)
-            d_attn_flat = d_attn.view(B * num_docs, L)
-            d_emb_flat = self.student.encode(d_ids_flat, d_attn_flat)
+            q_emb = self.student.encode(queries_raw, max_length=self.cfg.max_q_len)
+            flat_docs = [doc for docs in docs_raw for doc in docs]
+            d_emb_flat = self.student.encode(flat_docs, max_length=self.cfg.max_d_len)
             d_emb = d_emb_flat.view(B, num_docs, -1)
 
             scores = torch.sum(q_emb.unsqueeze(1) * d_emb, dim=-1)
