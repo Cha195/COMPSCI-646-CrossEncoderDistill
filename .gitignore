@@ -8,3 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
+kd_multihop_dev_set.jsonl
+checkpoints/
